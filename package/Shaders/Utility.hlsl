@@ -339,6 +339,56 @@ float SampleShadowPCF(Texture2DArray<float4> tex, SamplerComparisonState samp, f
 	return visibility / ShadowPCFSampleCount;
 }
 
+// ---- DragonShaders: contact-hardening sun shadows (PCSS) ----------------------------------
+// Blocker search + penumbra estimate adapted from BlitzFX ShadowCommon.hlsli
+// (c) 2024 Sven Lüpke, MIT License, https://github.com/sven-luepke/blitz-fx
+// Penumbra from the sun's angular size in world units (orthographic cascades), so the result
+// does not depend on the cascade the pixel falls in.
+#	ifndef DS_PCSS
+#		define DS_PCSS 1
+#	endif
+#	ifndef DS_PCSS_SUN_SIZE
+#		define DS_PCSS_SUN_SIZE 6.0  // multiplier of the real sun angular radius (0.267 deg); 1 = physical
+#	endif
+#	ifndef DS_PCSS_MAX_RADIUS
+#		define DS_PCSS_MAX_RADIUS 8.0  // max filter radius, in multiples of the vanilla PCF radius
+#	endif
+static const float DS_SunTanHalfAngle = 0.00466;  // tan(0.267 deg)
+
+float SampleShadowPCSS(Texture2DArray<float4> texRaw, SamplerState sampRaw, Texture2DArray<float4> tex, SamplerComparisonState samp,
+	float2 baseUV, float layerIndex, float compareValue, float2x2 rotationMatrix, float baseRadius, float4x3 lightProj)
+{
+	float3x4 T = transpose(lightProj);
+	float uvPerWorld = length(T[0].xyz);
+	float depthPerWorld = max(length(T[2].xyz), 1e-9);
+
+	// 1) blocker search over the largest penumbra we allow
+	float searchRadius = baseRadius * DS_PCSS_MAX_RADIUS;
+	float blockerSum = 0;
+	float blockerCount = 0;
+	[unroll] for (uint i = 0; i < ShadowPCFSampleCount; i++)
+	{
+		float2 offset = mul(GetShadowPCFOffset(i), rotationMatrix) * searchRadius;
+		float d = texRaw.SampleLevel(sampRaw, float3(baseUV + offset, layerIndex), 0).x;
+		if (d < compareValue) {
+			blockerSum += d;
+			blockerCount += 1;
+		}
+	}
+	if (blockerCount < 0.5)
+		return 1.0;  // nothing in the way
+
+	// 2) penumbra width: receiver-blocker distance (world units) x tan(sun half angle) -> shadow-map uv
+	float blockerDepth = blockerSum / blockerCount;
+	float worldDistance = max(compareValue - blockerDepth, 0) / depthPerWorld;
+	float penumbraUV = worldDistance * DS_SunTanHalfAngle * DS_PCSS_SUN_SIZE * uvPerWorld;
+	float radius = clamp(penumbraUV, baseRadius * 0.5, searchRadius);
+
+	// 3) filter with the estimated radius
+	return SampleShadowPCF(tex, samp, baseUV, layerIndex, compareValue, rotationMatrix, radius);
+}
+// --------------------------------------------------------------------------------------------
+
 float SampleShadow3x3(Texture2DArray<float4> tex, SamplerComparisonState samp, float2 baseUV, float layerIndex, float compareValue, float2 texelSize)
 {
 	float visibility = 0.0;
@@ -513,6 +563,8 @@ PS_OUTPUT main(PS_INPUT input)
 		shadowVisibility = TexShadowMapSamplerComp.SampleCmpLevelZero(SampShadowMapSamplerComp, float3(positionLS.xy, cascadeIndex), shadowMapCompareValue).x;
 #			elif SHADOWFILTER == 2
 		shadowVisibility = SampleShadow3x3(TexShadowMapSamplerComp, SampShadowMapSamplerComp, positionLS.xy, cascadeIndex, shadowMapCompareValue, ShadowSampleParam.zw);
+#			elif (SHADOWFILTER == 4 || SHADOWFILTER == 8) && DS_PCSS
+		shadowVisibility = SampleShadowPCSS(TexShadowMapSampler, SampShadowMapSampler, TexShadowMapSamplerComp, SampShadowMapSamplerComp, positionLS.xy, cascadeIndex, shadowMapCompareValue, rotationMatrix, ShadowSampleParam.z, lightProjectionMatrix);
 #			elif SHADOWFILTER == 4 || SHADOWFILTER == 8
 		shadowVisibility = SampleShadowPCF(TexShadowMapSamplerComp, SampShadowMapSamplerComp, positionLS.xy, cascadeIndex, shadowMapCompareValue, rotationMatrix, ShadowSampleParam.z);
 #			endif
@@ -532,6 +584,8 @@ PS_OUTPUT main(PS_INPUT input)
 			cascade1ShadowVisibility = TexShadowMapSamplerComp.SampleCmpLevelZero(SampShadowMapSamplerComp, float3(cascade1PositionLS.xy, 1), cascade1ShadowMapCompareValue).x;
 #			elif SHADOWFILTER == 2
 			cascade1ShadowVisibility = SampleShadow3x3(TexShadowMapSamplerComp, SampShadowMapSamplerComp, cascade1PositionLS.xy, 1, cascade1ShadowMapCompareValue, ShadowSampleParam.zw);
+#			elif (SHADOWFILTER == 4 || SHADOWFILTER == 8) && DS_PCSS
+			cascade1ShadowVisibility = SampleShadowPCSS(TexShadowMapSampler, SampShadowMapSampler, TexShadowMapSamplerComp, SampShadowMapSamplerComp, cascade1PositionLS.xy, 1, cascade1ShadowMapCompareValue, rotationMatrix, ShadowSampleParam.z, ShadowMapProj[1]);
 #			elif SHADOWFILTER == 4 || SHADOWFILTER == 8
 			cascade1ShadowVisibility = SampleShadowPCF(TexShadowMapSamplerComp, SampShadowMapSamplerComp, cascade1PositionLS.xy, 1, cascade1ShadowMapCompareValue, rotationMatrix, ShadowSampleParam.z);
 #			endif
